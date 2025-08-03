@@ -1,10 +1,13 @@
 #include <M5Stack.h>
 #include <Wire.h>
+#include "BaseX.h"
+BASE_X baseX;
 
 // 関数プロトタイプ宣言
 void calculatePID();
 void controlMotor();
 void sendMotorCommand(int power);
+void sendDualMotorCommand(int power3, int power4);
 void updateDisplay();
 void adjustParameters();
 
@@ -23,16 +26,24 @@ float derivative = 0.0;     // 微分項
 float pid_output = 0.0;     // PID制御出力
 
 // モータ制御用変数
-int motor_power = 0;        // モータ出力パワー
+int motor_power = 0;        // 基本モータ出力パワー
+int motor3_power = 0;       // MOTOR3出力パワー
+int motor4_power = 0;       // MOTOR4出力パワー
 unsigned long last_time = 0;
 float dt = 0.01;            // 制御周期（10ms）
 
 // BaseXのI2Cアドレス（通常は0x26）
 #define BASEX_ADDR 0x26
 
-// BaseXレジスタアドレス
-#define MOTOR_REG 0x00
-#define SERVO_REG 0x10
+// BaseXモータアドレス（公式仕様）
+#define MOTOR1_ADDR 0x50
+#define MOTOR2_ADDR 0x60
+#define MOTOR3_ADDR 0x70
+#define MOTOR4_ADDR 0x80
+
+// 倒立振子で使用するモータ（MOTOR3とMOTOR4を使用）
+#define MOTOR_LEFT MOTOR3_ADDR   // 左モータ
+#define MOTOR_RIGHT MOTOR4_ADDR  // 右モータ
 
 void setup() {
     M5.begin();
@@ -43,6 +54,19 @@ void setup() {
     
     // I2C初期化（BaseX通信用）
     Wire.begin();
+
+    // BaseX初期化
+    delay(100); // BaseX起動待ち
+    
+    // BaseX モーター初期設定
+    baseX.SetMode(3, NORMAL_MODE); // MOTOR3をNORMAL_MODEに設定
+    baseX.SetMode(4, NORMAL_MODE); // MOTOR4をNORMAL_MODEに設定
+    
+    // モータを停止状態で初期化
+    baseX.SetMotorSpeed(3, 0);
+    baseX.SetMotorSpeed(4, 0);
+    
+    Serial.println("BaseX Motors initialized");
     
     // IMU初期化
     M5.IMU.Init();
@@ -86,7 +110,7 @@ void loop() {
     if (M5.BtnB.wasPressed()) {
         // 緊急停止
         motor_power = 0;
-        sendMotorCommand(0);
+        sendDualMotorCommand(0, 0);
         Serial.println("Emergency stop");
     }
     
@@ -111,8 +135,8 @@ void loop() {
     
     // シリアル出力（デバッグ用）
     if (current_time % 100 == 0) {  // 100ms毎
-        Serial.printf("Pitch: %.2f, Error: %.2f, PID: %.2f, Motor: %d\n", 
-                     pitch, error, pid_output, motor_power);
+        Serial.printf("Pitch: %.2f, Error: %.2f, PID: %.2f, M3: %d, M4: %d\n", 
+                     pitch, error, pid_output, motor3_power, motor4_power);
     }
     
     delay(5);
@@ -146,21 +170,41 @@ void controlMotor() {
     
     // モータが動作範囲内の傾斜角の場合のみ制御
     if (abs(pitch) < 45.0) {  // 45度以内
-        sendMotorCommand(motor_power);
+        // 両輪同じ方向に回転（前進・後退による姿勢制御）
+        motor3_power = motor_power;  // 左モータ
+        motor4_power = motor_power;  // 右モータ
+        sendDualMotorCommand(motor3_power, motor4_power);
     } else {
         // 倒れすぎた場合は停止
-        sendMotorCommand(0);
+        motor3_power = 0;
+        motor4_power = 0;
+        sendDualMotorCommand(0, 0);
     }
 }
 
 void sendMotorCommand(int power) {
-    // BaseX経由でEV3モータに指令送信
+    // 単一モータ制御（MOTOR3を使用）
     Wire.beginTransmission(BASEX_ADDR);
-    Wire.write(MOTOR_REG);  // モータレジスタ
+    Wire.write(MOTOR_LEFT);                     // モータアドレス（0x70 = MOTOR3）
     Wire.write((uint8_t)(power & 0xFF));        // 下位バイト
     Wire.write((uint8_t)((power >> 8) & 0xFF)); // 上位バイト
     Wire.endTransmission();
 }
+
+void sendDualMotorCommand(int power3, int power4) {
+    // BaseXライブラリを使用してモータ制御
+    // 範囲を-127〜127に制限（BaseXの仕様に合わせて調整）
+    int motor3_speed = constrain(power3, -127, 127);
+    int motor4_speed = constrain(power4, -127, 127);
+    
+    // BaseXライブラリでモータ制御（正しいメソッド名を使用）
+    baseX.SetMotorSpeed(3, motor3_speed); // MOTOR3
+    baseX.SetMotorSpeed(4, motor4_speed); // MOTOR4
+    
+    // デバッグ出力
+    Serial.printf("Motor commands: M3=%d, M4=%d\n", motor3_speed, motor4_speed);
+}
+
 
 void updateDisplay() {
     // LCD表示更新
@@ -170,8 +214,20 @@ void updateDisplay() {
     M5.Lcd.printf("Target: %.2f deg\n", target_angle);
     M5.Lcd.printf("Error: %.2f\n", error);
     M5.Lcd.printf("PID Out: %.2f\n", pid_output);
-    M5.Lcd.printf("Motor: %d\n", motor_power);
-    M5.Lcd.printf("\nKp:%.1f Ki:%.1f Kd:%.1f", kp, ki, kd);
+    M5.Lcd.printf("M3: %d  M4: %d\n", motor3_power, motor4_power);
+    
+    // 制御状態表示
+    if (abs(pitch) >= 45.0) {
+        M5.Lcd.setTextColor(RED);
+        M5.Lcd.printf("TILT STOP!\n");
+        M5.Lcd.setTextColor(WHITE);
+    } else {
+        M5.Lcd.setTextColor(GREEN);
+        M5.Lcd.printf("ACTIVE\n");
+        M5.Lcd.setTextColor(WHITE);
+    }
+    
+    M5.Lcd.printf("Kp:%.1f Ki:%.1f Kd:%.1f", kp, ki, kd);
     
     // 傾斜角の視覚表示
     int center_x = 160;
